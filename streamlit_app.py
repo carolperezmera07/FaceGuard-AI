@@ -1,13 +1,15 @@
 """
 FaceGuard AI — Aplicación Web en Streamlit para Clasificación Facial (Teachable Machine Keras Model)
+Compatible con Keras 2 y Keras 3 (Python 3.10 a 3.14 en Streamlit Community Cloud).
 Permite cargar datasets completos (ZIP o múltiples imágenes), clasificar por lotes o con cámara en vivo,
 y calcular métricas científicas de evaluación: Precisión, Recall, F1-Score, Matriz de Confusión y Curvas ROC / AUC.
-Lista para desplegar en Streamlit Community Cloud desde GitHub.
 """
 
 import os
 import io
+import json
 import zipfile
+import h5py
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
@@ -16,12 +18,13 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
-    classification_report,
     confusion_matrix,
     roc_curve,
     auc
 )
 from sklearn.preprocessing import label_binarize
+import tensorflow as tf
+from tensorflow.keras.layers import DepthwiseConv2D
 
 # Configuración de la página
 st.set_page_config(
@@ -31,34 +34,141 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Compatibilidad universal con DepthwiseConv2D exportado por Google Teachable Machine
-import tensorflow as tf
-from tensorflow.keras.layers import DepthwiseConv2D
 
 class CustomDepthwiseConv2D(DepthwiseConv2D):
+    """Elimina el argumento legado 'groups=1' exportado por Google Teachable Machine."""
     def __init__(self, *args, **kwargs):
         kwargs.pop("groups", None)
         super().__init__(*args, **kwargs)
 
 
+def _deserialize_functional_config(m1_cfg, custom_objects):
+    """Deserializa un diccionario de configuración Functional tanto en Keras 3 como en Keras 2."""
+    try:
+        from keras.src.legacy.saving import saving_utils
+        return saving_utils.model_from_config(m1_cfg, custom_objects=custom_objects)
+    except Exception:
+        return tf.keras.models.model_from_json(json.dumps(m1_cfg), custom_objects=custom_objects)
+
+
+def _load_flattened_teachable_machine_h5(model_path):
+    """
+    Reconstruye el modelo de Teachable Machine (keras_model.h5) aplanando la jerarquía
+    Sequential(Sequential(Functional, GAP), Sequential(Dense, Dense)) en un único grafo
+    Functional limpio y cargando los 263 tensores de pesos directamente desde HDF5.
+    Soluciona el ValueError de Keras 3 (Python 3.12 - 3.14) en Sequential._maybe_rebuild / input_spec.py.
+    """
+    custom_objs = {"DepthwiseConv2D": CustomDepthwiseConv2D}
+
+    with h5py.File(model_path, "r") as f:
+        raw_cfg = f.attrs.get("model_config")
+        if isinstance(raw_cfg, bytes):
+            raw_cfg = raw_cfg.decode("utf-8")
+        model_config = json.loads(raw_cfg)
+
+        # Extraer el backbone MobileNetV2 (Functional 'model1'), GlobalAveragePooling2D y las capas Dense
+        seq1_layers = model_config["config"]["layers"][1]["config"]["layers"]
+        m1_cfg = json.loads(json.dumps(seq1_layers[1]))  # Copia profunda
+        gap_cfg = seq1_layers[2]
+        seq3_layers = model_config["config"]["layers"][2]["config"]["layers"]
+
+        last_backbone_layer = m1_cfg["config"]["output_layers"][0][0]
+
+        # Conectar GlobalAveragePooling2D directamente a la salida del backbone (out_relu)
+        gap_node = {
+            "class_name": "GlobalAveragePooling2D",
+            "config": gap_cfg["config"],
+            "name": gap_cfg["config"]["name"],
+            "inbound_nodes": [[[last_backbone_layer, 0, 0, {}]]]
+        }
+        m1_cfg["config"]["layers"].append(gap_node)
+        prev_name = gap_node["name"]
+
+        # Conectar las capas Dense del cabezal clasificador (dense_Dense1 y dense_Dense2)
+        for d_layer in seq3_layers:
+            if d_layer["class_name"] == "Dense":
+                d_cfg = dict(d_layer["config"])
+                d_cfg.pop("batch_input_shape", None)
+                d_node = {
+                    "class_name": "Dense",
+                    "config": d_cfg,
+                    "name": d_cfg["name"],
+                    "inbound_nodes": [[[prev_name, 0, 0, {}]]]
+                }
+                m1_cfg["config"]["layers"].append(d_node)
+                prev_name = d_node["name"]
+
+        m1_cfg["config"]["output_layers"] = [[prev_name, 0, 0]]
+
+        # Construir el modelo Functional unificado (sin usar Sequential)
+        flat_model = _deserialize_functional_config(m1_cfg, custom_objs)
+
+        # Recolectar todos los tensores de pesos almacenados en f['model_weights']
+        tensors_by_layer = {}
+
+        def _collect_weights(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                parts = name.split("/")
+                if len(parts) >= 2:
+                    l_name = parts[-2]
+                    p_name = parts[-1].split(":")[0]  # ej. 'kernel:0' -> 'kernel'
+                    tensors_by_layer.setdefault(l_name, {})[p_name] = np.asarray(obj)
+
+        f["model_weights"].visititems(_collect_weights)
+
+        # Asignar los pesos exactos a cada capa del modelo
+        canonical_order = [
+            "kernel", "depthwise_kernel", "gamma", "beta", "bias", "moving_mean", "moving_variance"
+        ]
+        for layer in flat_model.layers:
+            if layer.name in tensors_by_layer and len(layer.weights) > 0:
+                p_map = tensors_by_layer[layer.name]
+                weights_to_set = []
+                for w_var in layer.weights:
+                    p_key = w_var.name.split("/")[-1].split(":")[0]
+                    if p_key in p_map:
+                        weights_to_set.append(p_map[p_key])
+                if len(weights_to_set) != len(layer.weights):
+                    weights_to_set = [p_map[k] for k in canonical_order if k in p_map]
+                if len(weights_to_set) == len(layer.weights):
+                    layer.set_weights(weights_to_set)
+
+        # Garantizar tensores únicos de entrada y salida (no listas)
+        inp = flat_model.inputs[0] if isinstance(flat_model.inputs, (list, tuple)) else flat_model.input
+        out = flat_model.outputs[0] if isinstance(flat_model.outputs, (list, tuple)) else flat_model.output
+        clean_model = tf.keras.Model(inputs=inp, outputs=out, name="faceguard_teachable_machine")
+        return clean_model
+
+
 @st.cache_resource(show_spinner="Cargando modelo keras_model.h5 y labels.txt...")
 def load_teachable_machine_model(model_path="keras_model.h5", labels_path="labels.txt"):
     """Carga el modelo Keras exportado de Teachable Machine y su archivo de etiquetas."""
-    model = tf.keras.models.load_model(
-        model_path,
-        compile=False,
-        custom_objects={"DepthwiseConv2D": CustomDepthwiseConv2D}
-    )
+    try:
+        model = _load_flattened_teachable_machine_h5(model_path)
+    except Exception:
+        model = tf.keras.models.load_model(
+            model_path,
+            compile=False,
+            custom_objects={"DepthwiseConv2D": CustomDepthwiseConv2D}
+        )
+
     with open(labels_path, "r", encoding="utf-8") as f:
         raw_labels = [line.strip() for line in f.readlines() if line.strip()]
 
-    # Extraer nombres limpios y etiquetas completas (ej. "0 Con mascarilla")
     clean_labels = []
     for line in raw_labels:
         parts = line.split(" ", 1)
         clean_labels.append(parts[1] if len(parts) > 1 and parts[0].isdigit() else line)
 
     return model, raw_labels, clean_labels
+
+
+def predict_batch(model, batch_input):
+    """Ejecuta la predicción garantizando un arreglo NumPy 2D de salida."""
+    preds = model.predict(batch_input, verbose=0)
+    if isinstance(preds, (list, tuple)):
+        preds = preds[0]
+    return np.asarray(preds)
 
 
 def preprocess_pil_image(pil_img):
@@ -92,7 +202,6 @@ def main():
         "Verificación de Bioseguridad Facial (`Con mascarilla`, `Sin mascarilla`, `Mascarilla incorrecta`)"
     )
 
-    # Cargar modelo
     if not os.path.exists("keras_model.h5") or not os.path.exists("labels.txt"):
         st.error("No se encontraron `keras_model.h5` o `labels.txt` en la raíz del repositorio.")
         st.stop()
@@ -103,7 +212,7 @@ def main():
     with st.sidebar:
         st.header("⚙️ Estado del Modelo")
         st.success("Modelo Activo: `keras_model.h5`")
-        st.markdown("**Arquitectura:** MobileNetV2 (`alpha=0.35`) + Dense(100, ReLU) + Dense(3, Softmax)")
+        st.markdown("**Arquitectura:** MobileNetV2 (`alpha=0.35`) + GlobalAveragePooling2D + Dense(100, ReLU) + Dense(3, Softmax)")
         st.markdown("**Resolución de Entrada:** `224 × 224 × 3`")
         st.markdown("**Clases Detectadas (`labels.txt`):**")
         for r_lbl in raw_labels:
@@ -143,20 +252,27 @@ def main():
                 "Etiqueta Real (Ground Truth) para evaluación:",
                 options=["Detectar automáticamente por nombre de archivo/carpeta"] + clean_labels
             )
-            use_local_dataset = st.button("⚡ Cargar Dataset de Prueba del Repositorio (`dataset/evaluacion`)")
+            use_local_dataset = st.button("⚡ Cargar Dataset de Prueba del Repositorio")
 
         items_to_process = []
 
-        # Si el usuario pulsa el botón de dataset local del repositorio
-        if use_local_dataset and os.path.exists("dataset/evaluacion"):
-            for root, _, files in os.walk("dataset/evaluacion"):
-                for fname in sorted(files):
-                    if fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-                        fpath = os.path.join(root, fname)
-                        with open(fpath, "rb") as f:
-                            items_to_process.append((fpath, f.read()))
+        if use_local_dataset:
+            if os.path.exists("dataset/evaluacion"):
+                for root, _, files in os.walk("dataset/evaluacion"):
+                    for fname in sorted(files):
+                        if fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                            fpath = os.path.join(root, fname)
+                            with open(fpath, "rb") as f:
+                                items_to_process.append((fpath, f.read()))
+            elif os.path.exists("dataset_evaluacion.zip"):
+                with zipfile.ZipFile("dataset_evaluacion.zip", "r") as z:
+                    for zinfo in z.infolist():
+                        if not zinfo.is_dir() and zinfo.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                            if "__MACOSX" not in zinfo.filename:
+                                items_to_process.append((zinfo.filename, z.read(zinfo.filename)))
+            else:
+                st.warning("Sube el archivo `dataset_evaluacion.zip` o tus propias imágenes en el selector de la izquierda.")
 
-        # Si el usuario subió archivos o un ZIP
         if uploaded_files:
             for uf in uploaded_files:
                 if uf.name.lower().endswith(".zip"):
@@ -172,7 +288,7 @@ def main():
             records = []
             y_true = []
             y_pred = []
-            y_Scores = []
+            y_scores = []
             thumbs = []
 
             progress = st.progress(0, text="Ejecutando inferencia con keras_model.h5...")
@@ -182,7 +298,7 @@ def main():
                 try:
                     pil_img = Image.open(io.BytesIO(file_bytes))
                     batch_input, resized_img = preprocess_pil_image(pil_img)
-                    preds = model.predict(batch_input, verbose=0)[0]
+                    preds = predict_batch(model, batch_input)[0]
 
                     pred_idx = int(np.argmax(preds))
                     if forced_class == "Detectar automáticamente por nombre de archivo/carpeta":
@@ -192,7 +308,7 @@ def main():
 
                     y_true.append(true_idx)
                     y_pred.append(pred_idx)
-                    y_Scores.append(preds)
+                    y_scores.append(preds)
                     thumbs.append((os.path.basename(fname), resized_img, clean_labels[pred_idx], float(preds[pred_idx])))
 
                     row = {
@@ -216,13 +332,12 @@ def main():
                 "df": df_results,
                 "y_true": np.array(y_true),
                 "y_pred": np.array(y_pred),
-                "y_scores": np.array(y_Scores),
+                "y_scores": np.array(y_scores),
                 "clean_labels": clean_labels
             }
 
             st.success(f"¡Dataset procesado exitosamente! Total: {len(df_results)} imágenes clasificadas.")
 
-            # Resumen rápido
             c1, c2, c3 = st.columns(3)
             acc_val = accuracy_score(y_true, y_pred) * 100
             c1.metric("Imágenes Procesadas", len(df_results))
@@ -231,7 +346,6 @@ def main():
 
             st.dataframe(df_results, use_container_width=True)
 
-            # Botón de descarga CSV
             csv_bytes = df_results.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "📥 Descargar Tabla de Resultados (CSV)",
@@ -240,14 +354,13 @@ def main():
                 mime="text/csv"
             )
 
-            # Galería de miniaturas
             st.markdown("#### 🖼️ Vista Previa de Muestras Clasificadas")
             cols = st.columns(6)
             for i, (t_name, t_img, t_pred, t_conf) in enumerate(thumbs[:12]):
                 with cols[i % 6]:
                     st.image(t_img, caption=f"{t_pred} ({t_conf*100:.1f}%)", use_container_width=True)
         else:
-            st.info("Sube imágenes o un archivo `.zip`, o haz clic en **'⚡ Cargar Dataset de Prueba del Repositorio'** para comenzar.")
+            st.info("Sube imágenes o un archivo `.zip` (por ejemplo `dataset_evaluacion.zip`) para comenzar.")
 
     # =========================================================================
     # PESTAÑA 2: MÉTRICAS DE EVALUACIÓN (PRECISIÓN, RECALL, F1, ROC Y AUC)
@@ -256,7 +369,7 @@ def main():
         st.subheader("📊 Evaluación Científica del Modelo: Precisión, Recall, F1-Score, ROC y AUC")
 
         if "eval_data" not in st.session_state or len(st.session_state["eval_data"]["y_true"]) == 0:
-            st.warning("Primero carga o selecciona un dataset en la **Pestaña 1** para calcular las métricas en vivo.")
+            st.warning("Primero carga un dataset en la **Pestaña 1** para calcular las métricas en vivo.")
         else:
             ed = st.session_state["eval_data"]
             y_true = ed["y_true"]
@@ -269,7 +382,6 @@ def main():
                 y_true, y_pred, average="macro", zero_division=0
             )
 
-            # Binarizar para Curvas ROC One-vs-Rest
             y_true_bin = label_binarize(y_true, classes=list(range(n_classes)))
             if n_classes == 2 and y_true_bin.shape[1] == 1:
                 y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
@@ -286,7 +398,6 @@ def main():
 
             macro_auc = float(np.nanmean(valid_aucs)) if valid_aucs else 0.0
 
-            # Tarjetas KPI
             k1, k2, k3, k4, k5 = st.columns(5)
             k1.metric("Accuracy (Exactitud)", f"{acc*100:.2f}%")
             k2.metric("Precision (Macro)", f"{prec_macro*100:.2f}%")
@@ -294,7 +405,6 @@ def main():
             k4.metric("F1-Score (Macro)", f"{f1_macro*100:.2f}%")
             k5.metric("Macro AUC-ROC", f"{macro_auc:.4f}")
 
-            # Tabla por clase
             prec_c, rec_c, f1_c, sup_c = precision_recall_fscore_support(
                 y_true, y_pred, labels=list(range(n_classes)), zero_division=0
             )
@@ -309,7 +419,6 @@ def main():
             st.markdown("#### 📑 Tabla Desglosada de Métricas por Clase")
             st.dataframe(df_metrics, use_container_width=True)
 
-            # Gráficas lado a lado: Matriz de Confusión y Curvas ROC
             g_col1, g_col2 = st.columns(2)
 
             with g_col1:
@@ -382,7 +491,7 @@ def main():
             if single_img_file is not None:
                 pil_img = Image.open(single_img_file)
                 batch_input, resized = preprocess_pil_image(pil_img)
-                preds = model.predict(batch_input, verbose=0)[0]
+                preds = predict_batch(model, batch_input)[0]
                 top_idx = int(np.argmax(preds))
                 top_label = clean_labels[top_idx]
                 top_conf = float(preds[top_idx]) * 100
