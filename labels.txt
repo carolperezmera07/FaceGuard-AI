@@ -1,0 +1,3 @@
+0 Con mascarilla
+1 Sin mascarilla
+2 Mascarilla incorrecta
